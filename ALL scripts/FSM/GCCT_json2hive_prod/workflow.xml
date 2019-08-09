@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<workflow-app xmlns="uri:oozie:workflow:0.5" name="j2h">
+    <start to="shell_1"/>
+    <action name="shell_1">
+        <shell xmlns="uri:oozie:shell-action:0.3">
+            <job-tracker>${resourceManager}</job-tracker>
+            <name-node>${nameNode}</name-node>
+            <exec>/user/latluri1/GCCT_json2hive_prod/json2hive.sh</exec>
+            <file>/user/latluri1/.latluri1.krb5.keytab#latluri1_keytab</file>
+            <file>/user/latluri1/GCCT_json2hive_prod/json2hive.sh</file>
+            <file>/user/latluri1/GCCT_json2hive_prod/json2hive.py#json2hive.py</file>
+            <file>/user/latluri1/spark-avro_2.11-4.0.0.jar#spark-avro_2.11-4.0.0.jar</file>
+        </shell>
+        <ok to="end"/>
+        <error to="kill"/>
+    </action>
+    <kill name="kill">
+        <message>${wf:errorMessage(wf:lastErrorNode())}</message>
+    </kill>
+    <end name="end"/>
+</workflow-app>

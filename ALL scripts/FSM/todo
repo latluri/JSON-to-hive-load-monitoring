@@ -1,0 +1,5 @@
+Add entitylogical name in duplicate records
+Add message__id for duplicate records
+Partition tables
+Add process id and time in audit table
+Place audit table in a new database

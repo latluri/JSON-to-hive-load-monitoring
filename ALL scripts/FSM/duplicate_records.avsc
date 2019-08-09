@@ -1,0 +1,33 @@
+{
+  "type" : "record",
+  "name" : "topLevelRecord",
+  "fields" : [ {
+    "name" : "entitylogicalname",
+    "type" : [ "string", "null" ],
+    "default" :""
+  }, {
+    "name" : "entitystring",
+    "type" : [ "string", "null" ],
+    "default" :""
+  }, {
+    "name" : "gdia_load_date",
+    "type" : [ "string", "null" ],
+    "default" :""
+  }, {
+    "name" : "process__id",
+    "type" : [ "string", "null" ],
+    "default" :""
+  }, {
+    "name" : "reason",
+    "type" : [ "string", "null" ],
+    "default" :""
+  }, {
+    "name" : "sha_key",
+    "type" : [ "string", "null" ],
+    "default" :""
+  }, {
+    "name" : "sha_key2",
+    "type" : [ "string", "null" ],
+    "default" :""
+  } ]
+}

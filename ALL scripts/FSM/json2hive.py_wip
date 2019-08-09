@@ -1,0 +1,299 @@
+import os
+import sys
+import re
+#import pandas as pd
+import commands
+import uuid
+import json
+import ast
+import itertools
+import pyspark.sql.functions
+from pyspark.sql.functions import *
+from datetime import datetime
+from pyspark.sql import Row
+#from pyspark.sql.functions import row_number,lit,monotonically_increasing_id, col, size, length, when, struct, sha2, concat_ws
+from collections import Counter
+from datetime import datetime,timedelta
+from pyspark.sql.window import Window
+#from pyspark.sql.functions import to_json, struct
+import re
+from pyspark.sql.types import StructType, StructField, StringType
+#import numpy as np
+#from pyspark.sql import SparkSession
+
+
+from pyspark import SparkContext, SparkConf, HiveContext
+sc = SparkContext.getOrCreate()
+from pyspark.sql import SQLContext
+sqlContext = HiveContext(sparkContext=sc)
+sqlCtx = HiveContext(sparkContext=sc)
+
+
+
+
+today=datetime.today().strftime('%Y-%m-%d')
+today_full=datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+yesterday = (datetime.today() - timedelta(1)).strftime('%Y-%m-%d')
+day_b4_yesterday = (datetime.today() - timedelta(2)).strftime('%Y-%m-%d')
+
+db="j2h_fsm1"
+db_location="hdfs://hdp2cluster/project/dz/collab/"
+#Json_location="/project/dsc/prod/archive/10742_gcctmsd"
+Json_location="/project/dsc/prod/archive/60263_fsm"
+
+sqlContext.sql("use "+db)
+
+#sqlContext.sql("show tables").show()
+
+messages_2_days=commands.getoutput("hadoop fs -ls  "+Json_location+" | awk -F' +' -v g=\"{\" -v h=\"}\" -v q=\"'\" -v s=\":\" '{print g q$8q s q$6q h}'").splitlines()[1:]
+msg_2_days_dict={}
+for i in messages_2_days:
+    dict_=ast.literal_eval(i)
+    if dict_.keys()[0]!='':
+        msg_2_days_dict.update(dict_)
+msg_2_days_dict
+
+
+list_ids_in_db=sqlContext.table("audit").select("id").rdd.map(lambda l356: l356["id"]).collect()
+#list_ids_in_db=[i424["id"] for i424 in list_ids_in_db_row if i424["id"] !='']
+#list_ids_in_db
+
+list_2_load_keys=list(set(msg_2_days_dict.keys()).difference(set(list_ids_in_db)))[0:4]
+if len(list_2_load_keys)==0:
+    print("No Process ids to load")
+    exit()
+list_2_load_str="/* ".join(filter(None, list_2_load_keys))+"/*"
+list_2_load_keys_ids=[str(i429).split("/")[-1] for i429 in list_2_load_keys]
+
+print("\n\nThe following processids are loaded "+str(list_2_load_keys_ids).replace("[","").replace("]",""))
+
+
+ids_2_load=[[i425,msg_2_days_dict[i425]] for i425 in list_2_load_keys]
+
+#ids_2_load=[i400.split(" ") for i400 in list_ids_2_load]
+R = Row('id', 'date_')
+ids_2_load_df=sqlContext.createDataFrame([R(i421[0],i421[1]) for i421 in ids_2_load])
+
+
+#commands.getoutput("hadoop fs -cat "+list_2_load_str+"| perl -p -e 's/{\"entitydata\":/\n{\"entitydata\":/g'| grep -v \"^$\" |hadoop fs -put -f - JSON_INPUT_FSM")
+commands.getoutput("hadoop fs -cat "+list_2_load_str+"| perl -p -e 's/{\"entitydata\":/\n{\"entitydata\":/g'| grep -v \"^$\" |hadoop fs -put -f - "+db_location+db+"/raw/JSON_INPUT")
+
+#https://stackoverflow.com/questions/5508509/how-do-i-check-if-a-string-is-valid-json-in-python
+def is_json(myjson):
+    try:
+        json_object = json.loads(myjson)
+    except ValueError, e:
+        return({"_corrupt_record_data":"True"})
+    return(json_object)
+
+
+def create_table_stmnt(db_location,db,table):
+    return("""create external table """+table+"""
+stored as avro
+location '"""+db_location+db+"""/"""+table+"""'
+tblproperties('avro.schema.url'='"""+db_location+db+"""/schema/"""+table+"""/"""+table+""".avsc')
+""")
+
+
+def update_df(from_df,dump_df,deciding_col_rename,reason,list_col_bad_rec,deciding_col):
+    if deciding_col in from_df.columns:
+        dump_temp=from_df.filter(deciding_col+" is not null")
+        if len(dump_temp.head(1))>0:
+            #print("INFO: "+reason+": "+str(dump_temp.count()))
+            print("INFO: "+reason)
+	    dump_temp=dump_temp.withColumnRenamed(deciding_col,deciding_col_rename)
+            dump_temp=dump_temp.withColumn("reason", lit(reason))
+            dump_temp=dump_temp.select(list_col_bad_rec)
+            dump_df=dump_df.unionByName(dump_temp)
+            from_df=from_df.filter(deciding_col+" is null")
+        from_df=from_df.drop(deciding_col)
+        return(from_df,dump_df)
+    else:
+        #print("No issues in observed")
+        return(from_df,dump_df)
+
+
+def hive_create_new_table(final,db_location,db,table):
+        print("NEW_TABLE_ALERT: "+table)
+        create_update_schema(final,db_location,db,table)
+        #final.write.option("forceSchema", updated_schema).option("path",db_location+db+"/"+table).format("com.databricks.spark.avro").saveAsTable(db+"."+table)
+        #final.write.option("path",db_location+db+"/"+table).format("com.databricks.spark.avro").saveAsTable(db+"."+table)
+        #sqlContext.sql("drop table if exists "+db+"."+table)
+        stmnt=create_table_stmnt(db_location,db,table)
+        #print(stmnt)
+        sqlContext.sql(stmnt)
+        final.write.mode("append").format("com.databricks.spark.avro").insertInto(db+"."+table)
+
+
+
+def create_update_schema(final,db_location,db,table):
+    base="""{\n  "type" : "record",\n  "name" : "topLevelRecord",\n  "fields" : [ {"""
+    schema_end_part="\n  } ]\n}"
+    schema_attachment="".join("\n  }, {\n    \"name\" : \""+j16+"\",\n    \"type\" : [ \"string\", \"null\" ],\n    \"default\" :\"\"" for j16 in final.columns)
+    updated_schema_1=base+schema_attachment+schema_end_part
+    updated_schema=re.sub(r"^{\n  \"type\" : \"record\",\n  \"name\" : \"topLevelRecord\",\n  \"fields\" : \[ {\n  }, {\n","{\n  \"type\" : \"record\",\n  \"name\" : \"topLevelRecord\",\n  \"fields\" : [ {\n",updated_schema_1)
+    schema_rdd=sc.parallelize([updated_schema]).coalesce(1,True)
+    schema_rdd_df=sqlContext.createDataFrame(schema_rdd, StringType())
+    schema_rdd_df.write.mode("overwrite").text(db_location+db+"/"+"schema/"+table,compression=None)
+    commands.getoutput(" hadoop fs -mv  "+db_location+db+"/schema/"+table+"/part-00000* "+db_location+db+"/schema/"+table+"/"+table+".avsc")
+
+
+def  add_columns(final,table):
+    col_in_new_data=[j28.lower() for j28 in final.columns]
+    col_in_table=sqlContext.table(table).columns
+    list_2_add=set(col_in_new_data).difference(set(col_in_table))
+    list_2_add_maintain_schema=set(col_in_table).difference(set(col_in_new_data))
+    if len(list_2_add_maintain_schema)>0:
+        print("INFO: "+table+" JSON contains less columns than expected such as: "+str(list_2_add_maintain_schema).replace("set([","").replace("])",""))
+        for i386 in list_2_add_maintain_schema:
+            final=final.withColumn(i386,lit(unicode("")))
+    if len(list_2_add)>0:
+        print("INFO: "+table+" New column(s) added :"+str(list_2_add).replace("set([","").replace("])",""))
+        updated_col_table=col_in_table+list(list_2_add)
+        final=final.select(*updated_col_table)
+    else:
+        print("INFO: "+table+" No new columns found appending new messages")
+        final=final.select(*col_in_table)
+    return(final)
+
+
+
+def extract_nested_json(source_dataframe,table,col_table_name,col_nested_data,cols_to_add_hash):
+    df2=source_dataframe.filter('lower('+col_table_name+') =='+'\"'+table+'\"')
+    df2_1_col=df2.select(col_nested_data).rdd.map(lambda p1:is_json(p1[col_nested_data])).map(lambda g2: [k.lower() for k in g2.keys()]).reduce(lambda h77,h78: list(set(h77+h78)))
+    df2_1=df2.select(col_nested_data).rdd.map(lambda p1:is_json(p1[col_nested_data])).map(lambda g2: dict((k.lower(), unicode(v)) if type(v) != "unicode" else ((k.lower(), v)) for k, v in g2.iteritems())).map(lambda g4: dict((k29,unicode("")) if k29 not in g4.keys() else (k29,g4[k29]) for k29 in df2_1_col))
+    df3_2=df2_1.map(lambda v:Row(**v)).toDF()
+    df2=df2.withColumn("columnindex",  row_number().over(Window().partitionBy(lit("A")).orderBy(lit('A'))))
+    df3_2=df3_2.withColumn("columnindex", row_number().over(Window().partitionBy(lit("A")).orderBy(lit('A'))))
+    final=df2.join(df3_2, df2.columnindex == df3_2.columnindex, 'inner').drop(df3_2.columnindex)
+    final=final.drop('columnindex')
+    sha_columns=df3_2.columns
+    sha_columns.remove("columnindex")
+    if type(cols_to_add_hash)==list:
+        sha_columns.extend(cols_to_add_hash)
+    else:
+        sha_columns.append("eventtype")
+    final=final.withColumn("sha_key", sha2(concat_ws("||", *sha_columns), 256))
+    return(final)
+
+
+sqlContext.clearCache()
+today_full=datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+df=sqlContext.read.json(db_location+db+"/raw/JSON_INPUT").cache()
+Raw_jsons=df.count()
+if Raw_jsons==0:
+    print("\n\nNo data in the process ids")
+    ids_2_load_df.write.mode("append").insertInto(db+".audit")
+    exit()
+df=df.sort("entitylogicalname")
+process__id=str(uuid.uuid1())
+df=df.withColumn("Process__id", lit(process__id))
+df=df.withColumn("gdia_load_date", lit(str(today_full)))
+df=df.withColumnRenamed('messageid','message__id')
+
+bad_records=sqlContext.createDataFrame(Row(**x) for x in [{"entitystring":"","process__id":"","gdia_load_date":"","reason":""}]).where("entitystring is null")
+duplicate_records=sqlContext.createDataFrame(Row(**x) for x in [{"entitystring":"","process__id":"","gdia_load_date":"","reason":"","sha_key":""}]).where("entitystring is null")
+
+df,bad_records=update_df(from_df=df,dump_df=bad_records,deciding_col_rename="entitystring",reason="JSON parsing issues audit columns",list_col_bad_rec=["entitystring","process__id","gdia_load_date","reason"],deciding_col="_corrupt_record")
+df=df.withColumn("entitystring", to_json(struct(df.columns)))
+tables_2_load=df.select("entitylogicalname").distinct().rdd.map(lambda l494: l494["entitylogicalname"]).filter(lambda l509: l509 is not None).collect()
+
+
+sqlContext.sql("use "+db)
+tables_in_db=sqlContext.tables(db).select("tableName").rdd.map(lambda l321: l321["tableName"]).collect()
+#tables_in_db
+
+for i344_1 in tables_2_load:
+#i344_1="gcct_genericInformationtopic"
+#if i344_1=="gcct_genericInformationtopic":
+    i344=i344_1.lower()
+    print("\n\nTable: "+i344)
+    final=extract_nested_json(source_dataframe=df,table=i344,col_table_name="entitylogicalname",col_nested_data="entitydata",cols_to_add_hash="eventtype")
+    final,bad_records=update_df(from_df=final,dump_df=bad_records,deciding_col_rename="temp_col",reason="JSON parsing issue entity data",list_col_bad_rec=["entitystring","process__id","gdia_load_date","reason"],deciding_col="_corrupt_record_data")
+    final=final.drop('entitydata')
+    if len(final.head(a))>0:
+        for i1004 in final.columns:
+            final=final.withColumn(i1004, when(final[i1004]=='None',lit(unicode(''))).otherwise(final[i1004]))
+        final=final.select('*', row_number().over(Window.partitionBy('sha_key').orderBy(lit('sha_key'))).alias('dupeCount')).withColumn('dupeCount', when(col('dupeCount') == 1, lit(None)).otherwise(lit("True")))
+################################### prints "duplicates within the batch all the time"
+        final,duplicate_records=update_df(from_df=final,dump_df=duplicate_records,deciding_col_rename="temp_col",reason="Duplicates within the batch",list_col_bad_rec=["entitystring","process__id","gdia_load_date","reason","sha_key"],deciding_col="dupeCount")
+        if i344.lower() in tables_in_db:
+            #print("Table already existing: "+i344)
+############################################################################################################################
+            final_shakeys_2_load=final.select("sha_key").subtract(sqlContext.table(i344).select("sha_key")).withColumnRenamed('sha_key','sha_key_2load')
+            final=final.join(final_shakeys_2_load,how='left',on=final.sha_key==final_shakeys_2_load.sha_key_2load)
+            final=final.withColumn('sha_key_2load', when(col('sha_key_2load').isNull(), lit("True")).otherwise(lit(None)))
+            final,duplicate_records=update_df(from_df=final,dump_df=duplicate_records,deciding_col_rename="temp_col",reason="Duplicates accross the table",list_col_bad_rec=["entitystring","process__id","gdia_load_date","reason","sha_key"],deciding_col="sha_key_2load")
+############################################################################################################################
+            #sha_key_in_JSON=final.select("sha_key").rdd.map(lambda l223: l223["sha_key"]).collect()
+            #sha_key_already_in_table=sqlContext.table(i344).select("sha_key").rdd.map(lambda l226: l226["sha_key"] ).filter(lambda l666: l666 in sha_key_in_JSON).distinct().collect()
+            #final_shakeys_2_load_list=list(set(sha_key_in_JSON).difference(set(sha_key_already_in_table)))
+            #final_shakeys_2_load=sqlContext.createDataFrame(sc.parallelize(final_shakeys_2_load_list).map(lambda x71: Row(x71)),['sha_key_2load'])
+            #final.join(final_shakeys_2_load,final.sha_key==final_shakeys_2_load.sha_key_2load).withColumn('sha_key_2load', when(col('sha_key_2load').isNull(), lit("True")).otherwise(lit(None)))
+            #final,duplicate_records=update_df(final,duplicate_records,"temp_col","Duplicates accross the table",["entitystring","process__id","gdia_load_date","reason","sha_key"],"sha_key_2load")
+############################################################################################################################
+            final=final.drop('entitystring')
+############################################################################################################################
+            final=add_columns(final,table=i344)
+            create_update_schema(final,db_location,db,table=i344)
+            final.write.mode("append").format("com.databricks.spark.avro").insertInto(db+"."+i344)
+            #print("\nLOADED :"+str(i344)+":"+str(final.count()))
+        else:
+            final=final.drop('entitystring')
+            hive_create_new_table(final,db_location,db,i344)
+           # print("\nLOADED :"+str(i344)+":"+str(final.count()))
+    else:
+        print("INFO: No Data to load the table "+i344+". Please Investigate for ALL bad records")
+
+
+
+if len(bad_records.head(1))>0:
+    commands.getoutput(" echo \"Bad records observed. Please investigate process id "+str(process__id)+" and gdia_load_date "+str(today_full)+"\" | mailx -s \"Bad_records in "+str(db)+"\" latluri1@ford.com")
+    if "bad_records" in tables_in_db:
+        #print("\nLOADED :bad_records :"+str(bad_records.count()))
+        bad_records.write.mode("append").format("com.databricks.spark.avro").insertInto(db+".bad_records")
+    else:
+        #print("\nLOADED :bad_records :"+str(bad_records.count()))
+        hive_create_new_table(bad_records,db_location,db,"bad_records")
+
+if len(duplicate_records.head(1))>0:
+    if "duplicate_records" in tables_in_db:
+        #print("\nLOADED :duplicate_records :"+str(duplicate_records.count()))
+        duplicate_records.write.mode("append").format("com.databricks.spark.avro").insertInto(db+".duplicate_records")
+    else:
+        #print("\nLOADED :duplicate_records :"+str(duplicate_records.count()))
+        hive_create_new_table(duplicate_records,db_location,db,"duplicate_records")
+
+
+
+#Final check
+m=0
+print("\n\nThe following tables are loaded with process__id as "+process__id+" and gdia_load_date "+today_full)
+tables_in_db_updated=sqlContext.tables(db).select("tableName").rdd.map(lambda l321: l321["tableName"]).collect()
+tables_loaded=list(set(tables_2_load).intersection(set(tables_in_db_updated)))
+if "duplicate_records" in tables_in_db_updated:
+	tables_loaded.append("duplicate_records")
+if "bad_records" in tables_in_db_updated:
+	tables_loaded.append("bad_records")
+#for i in sqlContext.tables(db).select("tableName").where("tableName != 'audit'").collect():
+    #j=i["tableName"]
+for j in tables_loaded:
+	k=sqlContext.table(j).where("process__id='"+process__id+"'").count()
+    	print (str(j)+":"+str(k))
+    	m=m+k
+
+
+print("Total:"+str(m))
+
+######################Check if Duplicates are to be removed
+Raw_jsons=str(Raw_jsons).strip()
+m=str(m).strip()
+
+
+if Raw_jsons==m:
+    print(str(m)+" Jsons loaded into tables successfully.")
+    ids_2_load_df.write.mode("append").insertInto(db+".audit")
+else:
+    print("Read "+str(Raw_jsons)+" and loaded "+str(m)+". Please investigate further. Search the data by gdia_load_date:"+today_full)
+
+
